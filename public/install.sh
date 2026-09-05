@@ -15,7 +15,13 @@
 #   FIREBASE_CREDENTIALS_FILE=/root/key.json DOMAIN=bot.example.com \
 #   TLS_EMAIL=me@example.com bash install.sh
 #
-# Flags:  --dry-run   validate everything, change nothing
+# To pull the newest commit onto an existing server, rebuild and restart
+# (settings in .env, nginx and HTTPS are all left alone):
+#
+#   GITHUB_TOKEN=github_pat_xxx bash install.sh --update
+#
+# Flags:  --update    update an existing install to the newest commit
+#         --dry-run   validate everything, change nothing
 #         --no-tls    skip the Let's Encrypt certificate
 #         --rotate-password  generate a new dashboard password on re-install
 # ---------------------------------------------------------------------------
@@ -31,6 +37,7 @@ GO_MIN="${GO_MIN:-1.25.0}"
 GO_VERSION="${GO_VERSION:-1.25.0}"
 BINARY_NAME="v2raybot"
 DRY_RUN=0
+UPDATE=0
 NO_TLS=0
 ROTATE_PASSWORD="${ROTATE_PASSWORD:-0}"
 
@@ -52,6 +59,7 @@ run()  { if [ "$DRY_RUN" = 1 ]; then printf '   (dry-run) %s\n' "$*"; else "$@";
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
+    --update) UPDATE=1 ;;
     --no-tls) NO_TLS=1 ;;
     --rotate-password) ROTATE_PASSWORD=1 ;;
     --domain) DOMAIN="${2:-}"; shift ;;
@@ -74,13 +82,29 @@ printf '\n%sV2ray-Bot installer%s  ->  %s\n\n' "$BOLD" "$OFF" "$INSTALL_DIR"
 [ "$DRY_RUN" = 1 ] && warn "dry-run: nothing will be installed or changed."
 
 INTERACTIVE=0
-if [ -t 0 ]; then INTERACTIVE=1; elif [ -e /dev/tty ] && exec < /dev/tty 2>/dev/null; then INTERACTIVE=1; fi
+if [ -t 0 ]; then
+  INTERACTIVE=1
+elif { exec 0</dev/tty; } 2>/dev/null; then
+  INTERACTIVE=1
+fi
 ask() { # ask <prompt> <varname>
   local prompt="$1" name="$2" reply=""
   [ "$INTERACTIVE" = 1 ] || die "$name was not provided and there is no terminal to ask on. Pass it as an environment variable."
   while [ -z "$reply" ]; do printf '%s' "$prompt"; IFS= read -r reply || true; done
   printf -v "$name" '%s' "$reply" 2>/dev/null || eval "$name=\$reply"
 }
+
+if [ "$UPDATE" = 1 ]; then
+  [ -f "$INSTALL_DIR/.env" ] || die "no existing install at $INSTALL_DIR - run without --update first, or set INSTALL_DIR=/path"
+  step "Update mode: reusing the settings already in $INSTALL_DIR/.env"
+  [ -n "$BOT_TOKEN" ] || BOT_TOKEN="$(grep -m1 '^BOT_TOKEN=' "$INSTALL_DIR/.env" | cut -d= -f2-)"
+  [ -n "$ADMIN_CHAT_IDS" ] || ADMIN_CHAT_IDS="$(grep -m1 '^ADMIN_CHAT_IDS=' "$INSTALL_DIR/.env" | cut -d= -f2-)"
+  [ -n "$FIREBASE_CREDENTIALS_FILE" ] || FIREBASE_CREDENTIALS_FILE="$(grep -m1 '^FIREBASE_CREDENTIALS_FILE=' "$INSTALL_DIR/.env" | cut -d= -f2- || true)"
+  [ -n "$FIREBASE_CREDENTIALS_FILE" ] || FIREBASE_CREDENTIALS_FILE="$INSTALL_DIR/serviceAccountKey.json"
+  case "$FIREBASE_CREDENTIALS_FILE" in /*) : ;; *) FIREBASE_CREDENTIALS_FILE="$INSTALL_DIR/${FIREBASE_CREDENTIALS_FILE#./}" ;; esac
+  [ -r "$FIREBASE_CREDENTIALS_FILE" ] || FIREBASE_CREDENTIALS_FILE="$INSTALL_DIR/serviceAccountKey.json"
+  ok "dashboard password, nginx and HTTPS will be left untouched"
+fi
 
 # --- 1. base packages ------------------------------------------------------
 step "Installing base packages"
@@ -179,7 +203,7 @@ FB_EMAIL="$(printf '%s' "$FB_INFO" | awk '{print $2}')"
 ok "project $FIREBASE_PROJECT_ID ($FB_EMAIL)"
 
 # --- 5. domain -------------------------------------------------------------
-if [ -z "$DOMAIN" ] && [ "$INTERACTIVE" = 1 ]; then
+if [ -z "$DOMAIN" ] && [ "$INTERACTIVE" = 1 ] && [ "$UPDATE" != 1 ]; then
   echo "   Domain pointing at this server, e.g. bot.example.com"
   echo "   Leave empty to serve the dashboard on http://<server-ip> instead."
   printf '   Dashboard domain (optional): '; IFS= read -r DOMAIN || true
@@ -250,29 +274,44 @@ if [ "$DRY_RUN" = 1 ]; then
 else
   install -m 600 "$TMP_KEY" "$KEY_FILE"
   umask 077
-  cat > "$ENV_FILE" <<ENVEOF
-# Written by install.sh on $(date -u '+%Y-%m-%d %H:%M:%S UTC')
-BOT_TOKEN=$BOT_TOKEN
-ADMIN_CHAT_IDS=$ADMIN_CHAT_IDS
-FIREBASE_PROJECT_ID=$FIREBASE_PROJECT_ID
-FIREBASE_CREDENTIALS_FILE=$KEY_FILE
-DASHBOARD_ADDR=127.0.0.1:$DASHBOARD_PORT
-DASHBOARD_USERNAME=$DASHBOARD_USERNAME
-DASHBOARD_PASSWORD=$DASHBOARD_PASSWORD
-MAINTENANCE_MODE=false
-MAINTENANCE_MESSAGE=We are doing a quick update. Please try again soon.
-TEMPORARY_AUTO_APPROVE=false
-EXPIRY_NOTIFICATIONS_ENABLED=true
-REQUIRED_CHANNELS_ENABLED=false
-PREMIUM_CHANNELS_ENABLED=false
-FREE_FILES_ENABLED=false
-FREE_FILES_URL=
-PROMO_ENABLED=false
-OWNER_CONTACT=
-BACKUP_SERVER_ID=
-ENVEOF
+  declare -A ENVMAP=()
+  if [ -f "$ENV_FILE" ]; then
+    cp -a "$ENV_FILE" "$ENV_FILE.bak"
+    while IFS= read -r envline || [ -n "$envline" ]; do
+      case "$envline" in ''|'#'*) continue ;; esac
+      case "$envline" in *=*) : ;; *) continue ;; esac
+      ENVMAP["${envline%%=*}"]="${envline#*=}"
+    done < "$ENV_FILE"
+    ok "kept ${#ENVMAP[@]} existing setting(s); previous file saved as .env.bak"
+  fi
+  ENVMAP[BOT_TOKEN]="$BOT_TOKEN"
+  ENVMAP[ADMIN_CHAT_IDS]="$ADMIN_CHAT_IDS"
+  ENVMAP[FIREBASE_PROJECT_ID]="$FIREBASE_PROJECT_ID"
+  ENVMAP[FIREBASE_CREDENTIALS_FILE]="$KEY_FILE"
+  ENVMAP[DASHBOARD_PASSWORD]="$DASHBOARD_PASSWORD"
+  [ -n "${ENVMAP[DASHBOARD_USERNAME]:-}" ] || ENVMAP[DASHBOARD_USERNAME]="$DASHBOARD_USERNAME"
+  [ -n "${ENVMAP[DASHBOARD_ADDR]:-}" ] || ENVMAP[DASHBOARD_ADDR]="127.0.0.1:$DASHBOARD_PORT"
+  for pair in \
+    "MAINTENANCE_MODE=false" \
+    "MAINTENANCE_MESSAGE=We are doing a quick update. Please try again soon." \
+    "TEMPORARY_AUTO_APPROVE=false" \
+    "EXPIRY_NOTIFICATIONS_ENABLED=true" \
+    "REQUIRED_CHANNELS_ENABLED=false" "PREMIUM_CHANNELS_ENABLED=false" \
+    "REQUIRED_CHANNELS=" "PREMIUM_CHANNELS=" \
+    "FREE_FILES_ENABLED=false" "FREE_FILES_URL=" \
+    "PROMO_ENABLED=false" "OWNER_CONTACT=" "BACKUP_SERVER_ID=" \
+    "PANEL_BACKUP_CAPTION=" "BOT_BACKUP_CAPTION=" "START_ANIMATION="; do
+    envkey="${pair%%=*}"
+    [ -n "${ENVMAP[$envkey]+set}" ] || ENVMAP["$envkey"]="${pair#*=}"
+  done
+  {
+    printf '# Written by install.sh on %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+    for envkey in $(printf '%s\n' "${!ENVMAP[@]}" | sort); do
+      printf '%s=%s\n' "$envkey" "${ENVMAP[$envkey]}"
+    done
+  } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
-  ok "$ENV_FILE and $KEY_FILE written (owner-only)"
+  ok "$ENV_FILE and $KEY_FILE written (owner-only, existing values preserved)"
 fi
 
 # --- 9. clear any stale Telegram webhook ----------------------------------
@@ -313,6 +352,9 @@ UNITEOF
 fi
 
 # --- 11. nginx -------------------------------------------------------------
+if [ "$UPDATE" = 1 ]; then
+  ok "update mode: nginx and HTTPS left exactly as they are"
+else
 step "Configuring nginx"
 SITE_NAME="${DOMAIN:-v2raybot}"
 if [ "$DRY_RUN" = 1 ]; then
@@ -363,6 +405,8 @@ else
   warn "skipping HTTPS (no domain or no email given)"
 fi
 
+fi
+
 # --- 13. health check ------------------------------------------------------
 if [ "$DRY_RUN" = 0 ]; then
   step "Checking that it came up"
@@ -382,7 +426,9 @@ else
 fi
 
 printf '\n%s============================================================%s\n' "$BOLD" "$OFF"
-printf '%s  V2ray-Bot is installed%s\n' "$GRN$BOLD" "$OFF"
+TITLE="V2ray-Bot is installed"
+[ "$UPDATE" = 1 ] && TITLE="V2ray-Bot is updated"
+printf '%s  %s%s\n' "$GRN$BOLD" "$TITLE" "$OFF"
 printf '%s============================================================%s\n\n' "$BOLD" "$OFF"
 printf '  Bot          @%s\n' "$BOT_NAME"
 printf '  Dashboard    %s\n' "$URL"
@@ -397,6 +443,10 @@ else
 fi
 printf '\n  Firebase     %s\n' "$FIREBASE_PROJECT_ID"
 printf '  Admin ID     %s\n' "$ADMIN_CHAT_IDS"
+COMMIT="$(git -C "$INSTALL_DIR" log -1 --pretty=format:'%h %s' 2>/dev/null || true)"
+[ -n "$COMMIT" ] || COMMIT="unknown"
+printf '  Version      %s\n' "$COMMIT"
+printf '  Update       bash install.sh --update\n'
 printf '  Logs         journalctl -u %s -f\n' "$SERVICE_NAME"
 printf '  Restart      systemctl restart %s\n' "$SERVICE_NAME"
 printf '\n  Next: open the dashboard, then add your ISPs, packages, data plans,\n'

@@ -15,6 +15,14 @@ While `V2ray-Bot` is private, add a read-only GitHub token so the installer can 
 GITHUB_TOKEN=github_pat_xxxxx bash <(curl -fsSL https://v2raybot-installer.vercel.app/install.sh)
 ```
 
+## Updating a server
+
+```bash
+GITHUB_TOKEN=github_pat_xxxxx bash <(curl -fsSL https://v2raybot-installer.vercel.app/install.sh) --update
+```
+
+Pulls the newest commit, rebuilds, restarts, and keeps `.env`, the dashboard password, nginx and HTTPS as they are.
+
 ## Hosting
 
 Deployed as a static site. Vercel/Cloudflare Pages settings:
