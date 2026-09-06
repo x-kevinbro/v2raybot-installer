@@ -5,15 +5,16 @@
 #   bash <(curl -fsSL https://bot.primelinelk.com/install.sh)
 #
 # Installs Go and nginx, builds the bot, asks for the Telegram bot token,
-# the admin chat ID and the Firebase service-account JSON, generates a random
+# the admin chat ID and the Turso database details, generates a random
 # dashboard password, and starts everything as a systemd service.
+# Firebase is optional now and is only used for backup/import workflows.
 #
 # Every answer can also be supplied up-front as an environment variable for a
 # fully unattended install:
 #
 #   BOT_TOKEN=123:abc ADMIN_CHAT_IDS=5478442446 \
-#   FIREBASE_CREDENTIALS_FILE=/root/key.json DOMAIN=bot.example.com \
-#   TLS_EMAIL=me@example.com bash install.sh
+#   TURSO_DATABASE_URL=libsql://your-db.turso.io TURSO_AUTH_TOKEN=xxx \
+#   DOMAIN=bot.example.com TLS_EMAIL=me@example.com bash install.sh
 #
 # To pull the newest commit onto an existing server, rebuild and restart
 # (settings in .env, nginx and HTTPS are all left alone):
@@ -45,6 +46,9 @@ BOT_TOKEN="${BOT_TOKEN:-}"
 ADMIN_CHAT_IDS="${ADMIN_CHAT_IDS:-}"
 FIREBASE_PROJECT_ID="${FIREBASE_PROJECT_ID:-}"
 FIREBASE_CREDENTIALS_FILE="${FIREBASE_CREDENTIALS_FILE:-}"
+FIREBASE_CREDENTIALS_JSON="${FIREBASE_CREDENTIALS_JSON:-}"
+TURSO_DATABASE_URL="${TURSO_DATABASE_URL:-}"
+TURSO_AUTH_TOKEN="${TURSO_AUTH_TOKEN:-}"
 DOMAIN="${DOMAIN:-}"
 TLS_EMAIL="${TLS_EMAIL:-}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
@@ -99,10 +103,11 @@ if [ "$UPDATE" = 1 ]; then
   step "Update mode: reusing the settings already in $INSTALL_DIR/.env"
   [ -n "$BOT_TOKEN" ] || BOT_TOKEN="$(grep -m1 '^BOT_TOKEN=' "$INSTALL_DIR/.env" | cut -d= -f2-)"
   [ -n "$ADMIN_CHAT_IDS" ] || ADMIN_CHAT_IDS="$(grep -m1 '^ADMIN_CHAT_IDS=' "$INSTALL_DIR/.env" | cut -d= -f2-)"
+  [ -n "$TURSO_DATABASE_URL" ] || TURSO_DATABASE_URL="$(grep -m1 '^TURSO_DATABASE_URL=' "$INSTALL_DIR/.env" | cut -d= -f2- || true)"
+  [ -n "$TURSO_AUTH_TOKEN" ] || TURSO_AUTH_TOKEN="$(grep -m1 '^TURSO_AUTH_TOKEN=' "$INSTALL_DIR/.env" | cut -d= -f2- || true)"
   [ -n "$FIREBASE_CREDENTIALS_FILE" ] || FIREBASE_CREDENTIALS_FILE="$(grep -m1 '^FIREBASE_CREDENTIALS_FILE=' "$INSTALL_DIR/.env" | cut -d= -f2- || true)"
   [ -n "$FIREBASE_CREDENTIALS_FILE" ] || FIREBASE_CREDENTIALS_FILE="$INSTALL_DIR/serviceAccountKey.json"
   case "$FIREBASE_CREDENTIALS_FILE" in /*) : ;; *) FIREBASE_CREDENTIALS_FILE="$INSTALL_DIR/${FIREBASE_CREDENTIALS_FILE#./}" ;; esac
-  [ -r "$FIREBASE_CREDENTIALS_FILE" ] || FIREBASE_CREDENTIALS_FILE="$INSTALL_DIR/serviceAccountKey.json"
   ok "dashboard password, nginx and HTTPS will be left untouched"
 fi
 
@@ -163,45 +168,73 @@ printf '%s' "$ADMIN_CHAT_IDS" | grep -Eq '^-?[0-9]+(,-?[0-9]+)*$' \
   || die "admin chat ID must be numeric, e.g. 5478442446 or 5478442446,123456789"
 ok "admin id(s): $ADMIN_CHAT_IDS"
 
-# --- 4. Firebase -----------------------------------------------------------
-step "Firebase setup"
+# --- 4. Turso primary database + optional Firebase backup ------------------
+step "Turso primary database"
+if [ -z "$TURSO_DATABASE_URL" ]; then
+  echo "   Create a Turso database and paste its libsql:// URL."
+  ask "   Turso database URL: " TURSO_DATABASE_URL
+fi
+TURSO_DATABASE_URL="$(printf '%s' "$TURSO_DATABASE_URL" | tr -d '[:space:]')"
+case "$TURSO_DATABASE_URL" in
+  libsql://*|file://*|http://*|https://*|ws://*|wss://*) : ;;
+  *) die "TURSO_DATABASE_URL must start with libsql://, file://, https://, http://, wss:// or ws://" ;;
+esac
+if [ -z "$TURSO_AUTH_TOKEN" ] && [ "${TURSO_DATABASE_URL#libsql://}" != "$TURSO_DATABASE_URL" ]; then
+  echo "   Paste the auth token generated for that Turso database."
+  ask "   Turso auth token: " TURSO_AUTH_TOKEN
+fi
+TURSO_AUTH_TOKEN="$(printf '%s' "$TURSO_AUTH_TOKEN" | tr -d '[:space:]')"
+ok "Turso primary database configured"
+
+step "Optional Firebase backup/import setup"
 TMP_KEY="$(mktemp /tmp/fbkey.XXXXXX.json)"
 chmod 600 "$TMP_KEY"
 cleanup() { rm -f "$TMP_KEY"; }
 trap cleanup EXIT
-if [ -n "$FIREBASE_CREDENTIALS_FILE" ]; then
-  [ -r "$FIREBASE_CREDENTIALS_FILE" ] || die "cannot read $FIREBASE_CREDENTIALS_FILE"
+FB_INFO=""
+FB_PROJECT=""
+FB_EMAIL=""
+if [ -n "$FIREBASE_CREDENTIALS_JSON" ]; then
+  printf '%s' "$FIREBASE_CREDENTIALS_JSON" > "$TMP_KEY"
+elif [ -n "$FIREBASE_CREDENTIALS_FILE" ] && [ -r "$FIREBASE_CREDENTIALS_FILE" ]; then
   cat "$FIREBASE_CREDENTIALS_FILE" > "$TMP_KEY"
-else
-  [ "$INTERACTIVE" = 1 ] || die "set FIREBASE_CREDENTIALS_FILE=/path/to/serviceAccountKey.json"
-  cat <<'HOWTO'
-   In the Firebase console: Project settings -> Service accounts ->
-   "Generate new private key". Open the downloaded .json file, copy all of it,
-   paste it below, then press Enter and type END on its own line.
+elif [ "$INTERACTIVE" = 1 ] && [ "$UPDATE" != 1 ]; then
+  echo "   Firebase is optional now. It is only for backup/import from old projects."
+  printf '   Add Firebase service-account JSON now? [y/N]: '; IFS= read -r ADD_FIREBASE || true
+  case "$ADD_FIREBASE" in
+    y|Y|yes|YES)
+      cat <<'HOWTO'
+   Paste the Firebase service-account JSON below, then press Enter and type END on its own line.
 HOWTO
-  : > "$TMP_KEY"
-  while IFS= read -r line; do
-    [ "$line" = "END" ] && break
-    printf '%s\n' "$line" >> "$TMP_KEY"
-  done
+      : > "$TMP_KEY"
+      while IFS= read -r line; do
+        [ "$line" = "END" ] && break
+        printf '%s
+' "$line" >> "$TMP_KEY"
+      done
+      ;;
+  esac
 fi
-FB_INFO="$(python3 - "$TMP_KEY" <<'PY' || true
+if [ -s "$TMP_KEY" ]; then
+  FB_INFO="$(python3 - "$TMP_KEY" <<'PY' || true
 import json,sys
 try:
     d=json.load(open(sys.argv[1]))
-except Exception as e:
+except Exception:
     sys.exit(0)
 if d.get('type')!='service_account': sys.exit(0)
 if 'BEGIN PRIVATE KEY' not in d.get('private_key',''): sys.exit(0)
 print(d.get('project_id',''), d.get('client_email',''))
 PY
 )"
-[ -n "$FB_INFO" ] || die "that is not a valid Firebase service-account JSON key."
-FB_PROJECT="$(printf '%s' "$FB_INFO" | awk '{print $1}')"
-FB_EMAIL="$(printf '%s' "$FB_INFO" | awk '{print $2}')"
-[ -n "$FIREBASE_PROJECT_ID" ] || FIREBASE_PROJECT_ID="$FB_PROJECT"
-ok "project $FIREBASE_PROJECT_ID ($FB_EMAIL)"
-
+  [ -n "$FB_INFO" ] || die "that is not a valid Firebase service-account JSON key."
+  FB_PROJECT="$(printf '%s' "$FB_INFO" | awk '{print $1}')"
+  FB_EMAIL="$(printf '%s' "$FB_INFO" | awk '{print $2}')"
+  [ -n "$FIREBASE_PROJECT_ID" ] || FIREBASE_PROJECT_ID="$FB_PROJECT"
+  ok "optional Firebase configured: $FIREBASE_PROJECT_ID ($FB_EMAIL)"
+else
+  ok "skipping Firebase; Turso will be used as the live database"
+fi
 # --- 5. domain -------------------------------------------------------------
 if [ -z "$DOMAIN" ] && [ "$INTERACTIVE" = 1 ] && [ "$UPDATE" != 1 ]; then
   echo "   Domain pointing at this server, e.g. bot.example.com"
@@ -272,7 +305,13 @@ fi
 if [ "$DRY_RUN" = 1 ]; then
   printf '   (dry-run) write %s and %s (mode 600)\n' "$ENV_FILE" "$KEY_FILE"
 else
-  install -m 600 "$TMP_KEY" "$KEY_FILE"
+  if [ -s "$TMP_KEY" ]; then
+    install -m 600 "$TMP_KEY" "$KEY_FILE"
+  else
+    rm -f "$KEY_FILE"
+    : > "$KEY_FILE"
+    chmod 600 "$KEY_FILE"
+  fi
   umask 077
   declare -A ENVMAP=()
   if [ -f "$ENV_FILE" ]; then
@@ -286,8 +325,10 @@ else
   fi
   ENVMAP[BOT_TOKEN]="$BOT_TOKEN"
   ENVMAP[ADMIN_CHAT_IDS]="$ADMIN_CHAT_IDS"
-  ENVMAP[FIREBASE_PROJECT_ID]="$FIREBASE_PROJECT_ID"
-  ENVMAP[FIREBASE_CREDENTIALS_FILE]="$KEY_FILE"
+  ENVMAP[TURSO_DATABASE_URL]="$TURSO_DATABASE_URL"
+  ENVMAP[TURSO_AUTH_TOKEN]="$TURSO_AUTH_TOKEN"
+  if [ -n "$FIREBASE_PROJECT_ID" ]; then ENVMAP[FIREBASE_PROJECT_ID]="$FIREBASE_PROJECT_ID"; fi
+  if [ -s "$KEY_FILE" ]; then ENVMAP[FIREBASE_CREDENTIALS_FILE]="$KEY_FILE"; fi
   ENVMAP[DASHBOARD_PASSWORD]="$DASHBOARD_PASSWORD"
   if [ -n "${GITHUB_TOKEN:-}" ]; then
     # kept so the bot's /update command can fetch a private repository later
@@ -315,7 +356,7 @@ else
     done
   } > "$ENV_FILE"
   chmod 600 "$ENV_FILE"
-  ok "$ENV_FILE and $KEY_FILE written (owner-only, existing values preserved)"
+  ok "$ENV_FILE written (owner-only, existing values preserved)"
 fi
 
 # --- 9. clear any stale Telegram webhook ----------------------------------
@@ -445,7 +486,8 @@ else
   printf '  Password     (unchanged from the previous install)\n\n'
   printf '  Re-run with --rotate-password to generate a new one.\n'
 fi
-printf '\n  Firebase     %s\n' "$FIREBASE_PROJECT_ID"
+printf '\n  Database     Turso (%s)\n' "$TURSO_DATABASE_URL"
+if [ -n "$FIREBASE_PROJECT_ID" ]; then printf '  Firebase     %s (optional backup/import)\n' "$FIREBASE_PROJECT_ID"; fi
 printf '  Admin ID     %s\n' "$ADMIN_CHAT_IDS"
 COMMIT="$(git -C "$INSTALL_DIR" log -1 --pretty=format:'%h %s' 2>/dev/null || true)"
 [ -n "$COMMIT" ] || COMMIT="unknown"
