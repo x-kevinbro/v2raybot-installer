@@ -5,15 +5,19 @@
 #   bash <(curl -fsSL https://bot.primelinelk.com/install.sh)
 #
 # Installs Go and nginx, builds the bot, asks for the Telegram bot token,
-# the admin chat ID and the Turso database details, generates a random
-# dashboard password, and starts everything as a systemd service.
-# Firebase is optional now and is only used for backup/import workflows.
+# the admin chat ID, lets you choose Turso or Firebase as the primary
+# database, generates a random dashboard password, and starts everything
+# as a systemd service.
 #
 # Every answer can also be supplied up-front as an environment variable for a
 # fully unattended install:
 #
-#   BOT_TOKEN=123:abc ADMIN_CHAT_IDS=5478442446 \
+#   PRIMARY_DATABASE=turso BOT_TOKEN=123:abc ADMIN_CHAT_IDS=5478442446 \
 #   TURSO_DATABASE_URL=libsql://your-db.turso.io TURSO_AUTH_TOKEN=xxx \
+#   DOMAIN=bot.example.com TLS_EMAIL=me@example.com bash install.sh
+#
+#   PRIMARY_DATABASE=firebase BOT_TOKEN=123:abc ADMIN_CHAT_IDS=5478442446 \
+#   FIREBASE_PROJECT_ID=my-project FIREBASE_CREDENTIALS_JSON='{...}' \
 #   DOMAIN=bot.example.com TLS_EMAIL=me@example.com bash install.sh
 #
 # To pull the newest commit onto an existing server, rebuild and restart
@@ -47,6 +51,7 @@ ADMIN_CHAT_IDS="${ADMIN_CHAT_IDS:-}"
 FIREBASE_PROJECT_ID="${FIREBASE_PROJECT_ID:-}"
 FIREBASE_CREDENTIALS_FILE="${FIREBASE_CREDENTIALS_FILE:-}"
 FIREBASE_CREDENTIALS_JSON="${FIREBASE_CREDENTIALS_JSON:-}"
+PRIMARY_DATABASE="${PRIMARY_DATABASE:-}"
 TURSO_DATABASE_URL="${TURSO_DATABASE_URL:-}"
 TURSO_AUTH_TOKEN="${TURSO_AUTH_TOKEN:-}"
 DOMAIN="${DOMAIN:-}"
@@ -103,8 +108,10 @@ if [ "$UPDATE" = 1 ]; then
   step "Update mode: reusing the settings already in $INSTALL_DIR/.env"
   [ -n "$BOT_TOKEN" ] || BOT_TOKEN="$(grep -m1 '^BOT_TOKEN=' "$INSTALL_DIR/.env" | cut -d= -f2-)"
   [ -n "$ADMIN_CHAT_IDS" ] || ADMIN_CHAT_IDS="$(grep -m1 '^ADMIN_CHAT_IDS=' "$INSTALL_DIR/.env" | cut -d= -f2-)"
+  [ -n "$PRIMARY_DATABASE" ] || PRIMARY_DATABASE="$(grep -m1 '^PRIMARY_DATABASE=' "$INSTALL_DIR/.env" | cut -d= -f2- || true)"
   [ -n "$TURSO_DATABASE_URL" ] || TURSO_DATABASE_URL="$(grep -m1 '^TURSO_DATABASE_URL=' "$INSTALL_DIR/.env" | cut -d= -f2- || true)"
   [ -n "$TURSO_AUTH_TOKEN" ] || TURSO_AUTH_TOKEN="$(grep -m1 '^TURSO_AUTH_TOKEN=' "$INSTALL_DIR/.env" | cut -d= -f2- || true)"
+  [ -n "$FIREBASE_PROJECT_ID" ] || FIREBASE_PROJECT_ID="$(grep -m1 '^FIREBASE_PROJECT_ID=' "$INSTALL_DIR/.env" | cut -d= -f2- || true)"
   [ -n "$FIREBASE_CREDENTIALS_FILE" ] || FIREBASE_CREDENTIALS_FILE="$(grep -m1 '^FIREBASE_CREDENTIALS_FILE=' "$INSTALL_DIR/.env" | cut -d= -f2- || true)"
   [ -n "$FIREBASE_CREDENTIALS_FILE" ] || FIREBASE_CREDENTIALS_FILE="$INSTALL_DIR/serviceAccountKey.json"
   case "$FIREBASE_CREDENTIALS_FILE" in /*) : ;; *) FIREBASE_CREDENTIALS_FILE="$INSTALL_DIR/${FIREBASE_CREDENTIALS_FILE#./}" ;; esac
@@ -168,25 +175,58 @@ printf '%s' "$ADMIN_CHAT_IDS" | grep -Eq '^-?[0-9]+(,-?[0-9]+)*$' \
   || die "admin chat ID must be numeric, e.g. 5478442446 or 5478442446,123456789"
 ok "admin id(s): $ADMIN_CHAT_IDS"
 
-# --- 4. Turso primary database + optional Firebase backup ------------------
-step "Turso primary database"
-if [ -z "$TURSO_DATABASE_URL" ]; then
-  echo "   Create a Turso database and paste its libsql:// URL."
-  ask "   Turso database URL: " TURSO_DATABASE_URL
+# --- 4. primary database ---------------------------------------------------
+step "Primary database selection"
+PRIMARY_DATABASE="$(printf '%s' "$PRIMARY_DATABASE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+if [ -z "$PRIMARY_DATABASE" ]; then
+  if [ "$INTERACTIVE" = 1 ]; then
+    echo "   Choose the live database for the bot:"
+    echo "     1) Turso (recommended, fewer free-quota issues)"
+    echo "     2) Firebase / Firestore"
+    while :; do
+      printf '   Primary database [1]: '; IFS= read -r DB_CHOICE || true
+      DB_CHOICE="${DB_CHOICE:-1}"
+      case "$DB_CHOICE" in
+        1|turso|Turso|TURSO) PRIMARY_DATABASE="turso"; break ;;
+        2|firebase|Firebase|FIREBASE|firestore|Firestore|FIRESTORE) PRIMARY_DATABASE="firebase"; break ;;
+        *) echo "   Please enter 1 for Turso or 2 for Firebase." ;;
+      esac
+    done
+  else
+    PRIMARY_DATABASE="turso"
+  fi
 fi
-TURSO_DATABASE_URL="$(printf '%s' "$TURSO_DATABASE_URL" | tr -d '[:space:]')"
-case "$TURSO_DATABASE_URL" in
-  libsql://*|file://*|http://*|https://*|ws://*|wss://*) : ;;
-  *) die "TURSO_DATABASE_URL must start with libsql://, file://, https://, http://, wss:// or ws://" ;;
+case "$PRIMARY_DATABASE" in
+  turso|firebase|firestore) : ;;
+  *) die "PRIMARY_DATABASE must be turso or firebase" ;;
 esac
-if [ -z "$TURSO_AUTH_TOKEN" ] && [ "${TURSO_DATABASE_URL#libsql://}" != "$TURSO_DATABASE_URL" ]; then
-  echo "   Paste the auth token generated for that Turso database."
-  ask "   Turso auth token: " TURSO_AUTH_TOKEN
-fi
-TURSO_AUTH_TOKEN="$(printf '%s' "$TURSO_AUTH_TOKEN" | tr -d '[:space:]')"
-ok "Turso primary database configured"
+[ "$PRIMARY_DATABASE" = "firestore" ] && PRIMARY_DATABASE="firebase"
+ok "primary database: $PRIMARY_DATABASE"
 
-step "Optional Firebase backup/import setup"
+if [ "$PRIMARY_DATABASE" = "turso" ]; then
+  step "Turso primary database"
+  if [ -z "$TURSO_DATABASE_URL" ]; then
+    echo "   Create a Turso database and paste its libsql:// URL."
+    ask "   Turso database URL: " TURSO_DATABASE_URL
+  fi
+  TURSO_DATABASE_URL="$(printf '%s' "$TURSO_DATABASE_URL" | tr -d '[:space:]')"
+  case "$TURSO_DATABASE_URL" in
+    libsql://*|file://*|http://*|https://*|ws://*|wss://*) : ;;
+    *) die "TURSO_DATABASE_URL must start with libsql://, file://, https://, http://, wss:// or ws://" ;;
+  esac
+  if [ -z "$TURSO_AUTH_TOKEN" ] && [ "${TURSO_DATABASE_URL#libsql://}" != "$TURSO_DATABASE_URL" ]; then
+    echo "   Paste the auth token generated for that Turso database."
+    ask "   Turso auth token: " TURSO_AUTH_TOKEN
+  fi
+  TURSO_AUTH_TOKEN="$(printf '%s' "$TURSO_AUTH_TOKEN" | tr -d '[:space:]')"
+  ok "Turso primary database configured"
+else
+  step "Firebase primary database"
+  echo "   Firebase/Firestore will be used as the live database."
+  echo "   Turso settings are not required."
+fi
+
+step "Firebase setup"
 TMP_KEY="$(mktemp /tmp/fbkey.XXXXXX.json)"
 chmod 600 "$TMP_KEY"
 cleanup() { rm -f "$TMP_KEY"; }
@@ -199,8 +239,13 @@ if [ -n "$FIREBASE_CREDENTIALS_JSON" ]; then
 elif [ -n "$FIREBASE_CREDENTIALS_FILE" ] && [ -r "$FIREBASE_CREDENTIALS_FILE" ]; then
   cat "$FIREBASE_CREDENTIALS_FILE" > "$TMP_KEY"
 elif [ "$INTERACTIVE" = 1 ] && [ "$UPDATE" != 1 ]; then
-  echo "   Firebase is optional now. It is only for backup/import from old projects."
-  printf '   Add Firebase service-account JSON now? [y/N]: '; IFS= read -r ADD_FIREBASE || true
+  if [ "$PRIMARY_DATABASE" = "firebase" ]; then
+    ADD_FIREBASE="y"
+    echo "   Paste your Firebase service-account JSON for the primary database."
+  else
+    echo "   Firebase is optional when Turso is primary. It is only for backup/import from old projects."
+    printf '   Add Firebase service-account JSON now? [y/N]: '; IFS= read -r ADD_FIREBASE || true
+  fi
   case "$ADD_FIREBASE" in
     y|Y|yes|YES)
       cat <<'HOWTO'
@@ -233,7 +278,13 @@ PY
   [ -n "$FIREBASE_PROJECT_ID" ] || FIREBASE_PROJECT_ID="$FB_PROJECT"
   ok "optional Firebase configured: $FIREBASE_PROJECT_ID ($FB_EMAIL)"
 else
+  if [ "$PRIMARY_DATABASE" = "firebase" ]; then
+    die "Firebase primary requires FIREBASE_CREDENTIALS_JSON or FIREBASE_CREDENTIALS_FILE"
+  fi
   ok "skipping Firebase; Turso will be used as the live database"
+fi
+if [ "$PRIMARY_DATABASE" = "firebase" ] && [ -z "$FIREBASE_PROJECT_ID" ]; then
+  die "Firebase primary requires FIREBASE_PROJECT_ID"
 fi
 # --- 5. domain -------------------------------------------------------------
 if [ -z "$DOMAIN" ] && [ "$INTERACTIVE" = 1 ] && [ "$UPDATE" != 1 ]; then
@@ -279,7 +330,9 @@ if [ "$DRY_RUN" = 1 ]; then
 else
   MODFLAG=""
   [ -d "$INSTALL_DIR/vendor" ] && MODFLAG="-mod=vendor"
-  ( cd "$INSTALL_DIR" && GOCACHE=/root/.cache/go-build go build $MODFLAG -o "$INSTALL_DIR/$BINARY_NAME" . ) \
+  BUILDTAGS=""
+  [ "$PRIMARY_DATABASE" = "firebase" ] && BUILDTAGS="-tags firestorelegacy"
+  ( cd "$INSTALL_DIR" && GOCACHE=/root/.cache/go-build go build $MODFLAG $BUILDTAGS -o "$INSTALL_DIR/$BINARY_NAME" . ) \
     || die "build failed (see the output above)."
   ok "built $INSTALL_DIR/$BINARY_NAME"
 fi
@@ -325,8 +378,11 @@ else
   fi
   ENVMAP[BOT_TOKEN]="$BOT_TOKEN"
   ENVMAP[ADMIN_CHAT_IDS]="$ADMIN_CHAT_IDS"
-  ENVMAP[TURSO_DATABASE_URL]="$TURSO_DATABASE_URL"
-  ENVMAP[TURSO_AUTH_TOKEN]="$TURSO_AUTH_TOKEN"
+  ENVMAP[PRIMARY_DATABASE]="$PRIMARY_DATABASE"
+  if [ "$PRIMARY_DATABASE" = "turso" ]; then
+    ENVMAP[TURSO_DATABASE_URL]="$TURSO_DATABASE_URL"
+    ENVMAP[TURSO_AUTH_TOKEN]="$TURSO_AUTH_TOKEN"
+  fi
   if [ -n "$FIREBASE_PROJECT_ID" ]; then ENVMAP[FIREBASE_PROJECT_ID]="$FIREBASE_PROJECT_ID"; fi
   if [ -s "$KEY_FILE" ]; then ENVMAP[FIREBASE_CREDENTIALS_FILE]="$KEY_FILE"; fi
   ENVMAP[DASHBOARD_PASSWORD]="$DASHBOARD_PASSWORD"
@@ -486,8 +542,12 @@ else
   printf '  Password     (unchanged from the previous install)\n\n'
   printf '  Re-run with --rotate-password to generate a new one.\n'
 fi
-printf '\n  Database     Turso (%s)\n' "$TURSO_DATABASE_URL"
-if [ -n "$FIREBASE_PROJECT_ID" ]; then printf '  Firebase     %s (optional backup/import)\n' "$FIREBASE_PROJECT_ID"; fi
+if [ "$PRIMARY_DATABASE" = "turso" ]; then
+  printf '\n  Database     Turso (%s)\n' "$TURSO_DATABASE_URL"
+  if [ -n "$FIREBASE_PROJECT_ID" ]; then printf '  Firebase     %s (optional backup/import)\n' "$FIREBASE_PROJECT_ID"; fi
+else
+  printf '\n  Database     Firebase (%s)\n' "$FIREBASE_PROJECT_ID"
+fi
 printf '  Admin ID     %s\n' "$ADMIN_CHAT_IDS"
 COMMIT="$(git -C "$INSTALL_DIR" log -1 --pretty=format:'%h %s' 2>/dev/null || true)"
 [ -n "$COMMIT" ] || COMMIT="unknown"
